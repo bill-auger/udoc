@@ -1,82 +1,167 @@
 #!/usr/bin/env ruby
 
+require_relative "udoc-debug"
 
-SOURCE_DIR         = 'Source'
-DOC_DIR            = 'Doc'
-CORRELATION_MSG    = " header files have corresponding documented headers"
-MISSING_SOURCE_MSG = "the following documented headers are not represented in source directory:\n"
-MISSING_DOC_MSG    = "the following source headers are not represented in doc directory:\n"
-CTAGS_CMD_HEAD     = "ctags -x --c-kinds=-d+p "
-CTAGS_CMD_TAIL     = " | sort -n -k 3"
-CTAGS_REGEX        = /^(\S+)\s*(\S+)\s*(\d+)\s*(\S*)\s*(.*)/
-SYMBOL_KEY         = :symbol
-ROLE_KEY           = :role
-LINE_N_KEY         = :line_n
-FILENAME_KEY       = :filename
-PROTOTYPE_KEY      = :prototype
-DIR_KEY            = :headers_dir
-HEADERS_KEY        = :header_files
-ENTITIES_KEY       = :header_entities
+
+SOURCE_DIR = 'Source'
+DOC_DIR    = 'Doc'
+CORRELATION_MSG      = " header files have corresponding documented headers\n"
+MISSING_SOURCE_MSG   = "the following documented headers are not represented in source directory:\n\t"
+ORPHAN_HEADER_PROMPT = "how would you like to resolve orphan "
+CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p "
+CTAGS_CMD_TAIL = " | sort -n -k 3"
+CTAGS_REGEX       = /^(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/
+LAST_TOKEN_REGEX  = /^.*\s+(\S+)\s*(;|{.*})\s*$/
+FIRST_TOKEN_REGEX = /^(\S+)\s+.*$/
+DIR_KEY         = :headers_dir
+HEADERS_KEY     = :header_files
+ENTITIES_KEY    = :header_entities
+SYMBOL_KEY      = :symbol
+ROLE_KEY        = :role
+LINE_N_KEY      = :line_n
+FILENAME_KEY    = :filename
+PROTOTYPE_KEY   = :prototype
+IS_VIRTUAL_KEY  = :is_virtual
+IS_OVERRIDE_KEY = :is_override
+ORPHANED_HEADER_HANDLERS = { 'b' => :backup_file    , 'd' => :delete_file   , 'r' => :rename_file   }
+ORPHANED_ENTITY_HANDLERS = { 'c' => :comment_entity , 'd' => :delete_entity , 'r' => :rename_entity }
+
 
 p "cannot find SOURCE_DIR '#{SOURCE_DIR}'" and exit unless Dir.exist? SOURCE_DIR
 p "cannot find DOC_DIR '#{DOC_DIR}'"       and exit unless Dir.exist? DOC_DIR
 
-@source = {}
-@doc    = {}
-@source[DIR_KEY     ] = SOURCE_DIR
-@source[HEADERS_KEY ] = source_headers  = []
-@source[ENTITIES_KEY] = source_entities = {}
-@doc   [DIR_KEY     ] = DOC_DIR
-@doc   [HEADERS_KEY ] = doc_headers     = []
-@doc   [ENTITIES_KEY] = doc_entities    = {}
-
-print "searching for *.h in SOURCE_DIR '#{SOURCE_DIR}'"
-Dir.chdir(SOURCE_DIR) { Dir["*.h"].each { | header | source_headers.push header } }
-print "searching for *.h in DOC_DIR '#{DOC_DIR}'"
-Dir.chdir(DOC_DIR   ) { Dir["*.h"].each { | header | doc_headers   .push header } }
-# p "source_headers=#{source_headers}" ; p "doc_headers=#{doc_headers}" ;
-
-# compare source headers to documented headers
-missing_source_headers = source_headers - doc_headers
-missing_doc_headers    = doc_headers    - source_headers
-correlated_headers     = source_headers & doc_headers
-uncorrelated_headers   = (source_headers + doc_headers) - correlated_headers
-print "#{correlated_headers.size} #{CORRELATION_MSG}"
-print MISSING_DOC_MSG unless missing_source_headers.empty?
-missing_source_headers.each { | header | print "\t#{header}\n" }
-print MISSING_SOURCE_MSG unless missing_doc_headers.empty?
-missing_doc_headers   .each { | header | print "\t#{header}\n" }
+@source_headers  = []
+@doc_headers     = []
+@source_entities = {} # indexed by header
+@doc_entities    = {} # indexed by header
+@undocumented_headers = []
+@orphaned_headers     = []
+@correlated_headers   = []
+@uncorrelated_headers = []
+@sources =
+{
+  DIR_KEY      => SOURCE_DIR       ,
+  HEADERS_KEY  => @source_headers  ,
+  ENTITIES_KEY => @source_entities ,
+}
+@docs =
+{
+  DIR_KEY      => DOC_DIR       ,
+  HEADERS_KEY  => @doc_headers  ,
+  ENTITIES_KEY => @doc_entities ,
+}
 
 
-# run CTAGS amd parse output for source headers and documented headers
-[ @source , @doc ].each do | ctags |
-  headers_dir = ctags[DIR_KEY    ]
-  headers     = ctags[HEADERS_KEY]
-  Dir.chdir headers_dir do
-    headers.each do | header |
-      ctags[ENTITIES_KEY][header] = entity_hashes = []
-      # list all default ctags entities (see `ctags --list-kinds=c`)
-      #     except macros (-d) plus methods (+p)
-      # e.g. MAX_DISPLAY_N    member      778 Constants.h      static const double MAX_DISPLAY_N = 4.0 ;
-      print "processing '#{header}' "
-      entities = `#{CTAGS_CMD_HEAD} "#{header}" #{CTAGS_CMD_TAIL}`.split "\n"
-      print "found (#{entities.size}) entities\n"
+def load_headers
+  [ @sources , @docs ].each do | data_hash |
+    # scan directories for header files
+    header_files = Dir.chdir(data_hash[DIR_KEY]) { Dir["*.h"] }
+    header_files.each { | header | data_hash[HEADERS_KEY].push header }
 
-# entities.each { |entity| print "entity=#{entity}\n" }
+dDEBUG_TRACE_N_HEADERS data_hash
 
-      # parse CTAGS output
-      entities.each do | entity |
-        entity_hash                = {}
-        entity_hash[SYMBOL_KEY   ] ,
-        entity_hash[ROLE_KEY     ] ,
-        entity_hash[LINE_N_KEY   ] ,
-        entity_hash[FILENAME_KEY ] ,
-        entity_hash[PROTOTYPE_KEY] = (CTAGS_REGEX.match entity).captures
+    data_hash[HEADERS_KEY].uniq!
+  end
+end
 
-        entity_hashes.push entity_hash
+def correlate_headers
+  # compare source headers to documented headers
+  @undocumented_headers = @source_headers       - @doc_headers
+  @orphaned_headers     = @doc_headers          - @source_headers
+  @correlated_headers   = @source_headers       & @doc_headers
+  @uncorrelated_headers = @undocumented_headers + @orphaned_headers
 
-# a_hash = entity_hashes[entity_hashes.size-1] ; print "\n\tfilename=#{a_hash[FILENAME_KEY]}\n" ; print "\tsymbol=#{a_hash[SYMBOL_KEY]}\n" ; print "\trole=#{a_hash[ROLE_KEY]}\n" ; print "\tline_n=#{a_hash[LINE_N_KEY]}\n" ; print "\tprototype=#{a_hash[PROTOTYPE_KEY]}\n"
+  print "#{@correlated_headers.size}/#{@source_headers.size}#{CORRELATION_MSG}"
+  print "#{MISSING_SOURCE_MSG}#{@orphaned_headers.join "\n\t"}\n" unless @orphaned_headers.empty?
+  until (header = @orphaned_headers.pop).nil?
+    print (prompt = "#{ORPHAN_HEADER_PROMPT}'#{header}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: ")
+    print prompt until ORPHANED_HEADER_HANDLERS.include? (choice = STDIN.gets.strip[0])
+    send ORPHANED_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{header}"
+  end
+
+  until (header = @undocumented_headers.pop).nil?
+    create_file "#{DOC_DIR}/#{header}"
+  end
+end
+
+def create_file filename
+  return if File.exist? filename
+
+  File.new filename , 'w' ; print "created file '#{filename}'\n" ;
+end
+
+def backup_file filename
+  return unless File.exist? filename
+
+  File.rename filename , "#{filename}.bak" ; print "backed up file '#{filename}'\n" ;
+end
+
+def delete_file filename
+  return unless File.exist? filename
+
+  File.delete filename ; print "deleted file '#{filename}'\n" ;
+end
+
+def rename_file old_filename
+  i = 0 ; print (prompt = "choose new filename:\n"                                                 +
+                ((@undocumented_headers.map { | header | "\t#{i = i + 1}) #{header}" }).join "\n") +
+                "\n?: ")
+  print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
+  new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
+  return unless (File.exists? old_filename) && !(File.exists? new_filename)
+
+  print "renaming file '#{old_filename}' to '#{new_filename}'\n"
+  File.rename old_filename , new_filename
+end
+
+def parse_ctags
+  # run CTAGS amd parse output for source headers and documented headers
+  [ @sources , @docs ].each do | data_hash |
+    headers_dir = data_hash[DIR_KEY    ]
+    headers     = data_hash[HEADERS_KEY]
+    Dir.chdir headers_dir do
+      headers.each do | header |
+        data_hash[ENTITIES_KEY][header] = []
+        # list all default ctags entities (see `ctags --list-kinds=c`)
+        #     except macros (-d) plus methods (+p)
+        # e.g. MAX_DISPLAY_N    member      778 Constants.h      static const double MAX_DISPLAY_N = 4.0 ;
+        print "\nprocessing '#{header}' - "
+        entities = `#{CTAGS_CMD_HEAD} "#{header}" #{CTAGS_CMD_TAIL}`.split "\n"
+        print "found (#{entities.size}) entities\n"
+
+        # parse CTAGS output
+        entities.each do | entity |
+          symbol , role , line_n , filename , prototype = (CTAGS_REGEX.match entity).captures
+
+          # detect abstract/interface methods
+          first_match = (FIRST_TOKEN_REGEX.match prototype)
+          last_match  = (LAST_TOKEN_REGEX .match prototype)
+          first_token = first_match.nil? ? '' : first_match.captures[0]
+          last_token  = last_match .nil? ? '' : last_match .captures[0]
+          is_override = last_token  == 'override'
+          is_virtual  = first_token == 'virtual' && !is_override
+
+          data_hash[ENTITIES_KEY][header].push
+          {
+            SYMBOL_KEY      => symbol      ,
+            ROLE_KEY        => role        ,
+            LINE_N_KEY      => line_n      ,
+            FILENAME_KEY    => filename    ,
+            PROTOTYPE_KEY   => prototype   ,
+            IS_OVERRIDE_KEY => is_override ,
+            IS_VIRTUAL_KEY  => is_virtual
+          }
+
+dDEBUG_TRACE_CTAG header , symbol , role , line_n , filename , prototype , is_override , is_virtual
+        end
       end
     end
   end
 end
+
+
+# main entry
+
+load_headers
+correlate_headers
+parse_ctags
