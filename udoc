@@ -5,24 +5,33 @@ require_relative "udoc-debug"
 
 SOURCE_DIR = 'Source'
 DOC_DIR    = 'Doc'
+
 CORRELATION_MSG      = " header files have corresponding documented headers\n"
 MISSING_SOURCE_MSG   = "the following documented headers are not represented in source directory:\n\t"
 ORPHAN_HEADER_PROMPT = "how would you like to resolve orphan "
-CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p "
+
+CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p " #   --recurse=[yes|no]
 CTAGS_CMD_TAIL = " | sort -n -k 3"
+
 CTAGS_REGEX       = /^(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/
 LAST_TOKEN_REGEX  = /^.*\s+(\S+)\s*(;|{.*})\s*$/
 FIRST_TOKEN_REGEX = /^(\S+)\s+.*$/
+
+ENTITIES_FIELDS = "id     INTEGER PRIMARY KEY , filename TEXT , identifier TEXT , is_override INTEGER ,
+                   line_n INTEGER             , kind     TEXT , prototype  TEXT , is_virtual  INTEGER"
+CREATE_ENTITIES_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Entities(#{ENTITIES_FIELDS})"
+
 DIR_KEY         = :headers_dir
 HEADERS_KEY     = :header_files
 ENTITIES_KEY    = :header_entities
-SYMBOL_KEY      = :symbol
-ROLE_KEY        = :role
+IDENTIFIER_KEY  = :identifier
+KIND_KEY        = :kind
 LINE_N_KEY      = :line_n
 FILENAME_KEY    = :filename
 PROTOTYPE_KEY   = :prototype
 IS_VIRTUAL_KEY  = :is_virtual
 IS_OVERRIDE_KEY = :is_override
+
 ORPHANED_HEADER_HANDLERS = { 'b' => :backup_file    , 'd' => :delete_file   , 'r' => :rename_file   }
 ORPHANED_ENTITY_HANDLERS = { 'c' => :comment_entity , 'd' => :delete_entity , 'r' => :rename_entity }
 
@@ -74,7 +83,7 @@ def correlate_headers
   print "#{@correlated_headers.size}/#{@source_headers.size}#{CORRELATION_MSG}"
   print "#{MISSING_SOURCE_MSG}#{@orphaned_headers.join "\n\t"}\n" unless @orphaned_headers.empty?
   until (header = @orphaned_headers.pop).nil?
-    print (prompt = "#{ORPHAN_HEADER_PROMPT}'#{header}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: ")
+    print prompt = "#{ORPHAN_HEADER_PROMPT}'#{header}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: "
     print prompt until ORPHANED_HEADER_HANDLERS.include? (choice = STDIN.gets.strip[0])
     send ORPHANED_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{header}"
   end
@@ -103,9 +112,9 @@ def delete_file filename
 end
 
 def rename_file old_filename
-  i = 0 ; print (prompt = "choose new filename:\n"                                                 +
+  i = 0 ; print prompt = "choose new filename:\n"                                                 +
                 ((@undocumented_headers.map { | header | "\t#{i = i + 1}) #{header}" }).join "\n") +
-                "\n?: ")
+                "\n?: "
   print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
   new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
   return unless (File.exists? old_filename) && !(File.exists? new_filename)
@@ -115,45 +124,36 @@ def rename_file old_filename
 end
 
 def parse_ctags
-  # run CTAGS amd parse output for source headers and documented headers
-  [ @sources , @docs ].each do | data_hash |
-    headers_dir = data_hash[DIR_KEY    ]
-    headers     = data_hash[HEADERS_KEY]
-    Dir.chdir headers_dir do
-      headers.each do | header |
-        data_hash[ENTITIES_KEY][header] = []
-        # list all default ctags entities (see `ctags --list-kinds=c`)
-        #     except macros (-d) plus methods (+p)
-        # e.g. MAX_DISPLAY_N    member      778 Constants.h      static const double MAX_DISPLAY_N = 4.0 ;
-        print "\nprocessing '#{header}' - "
-        entities = `#{CTAGS_CMD_HEAD} "#{header}" #{CTAGS_CMD_TAIL}`.split "\n"
-        print "found (#{entities.size}) entities\n"
+  # run CTAGS amd parse output for source headers
+  Dir.chdir @sources[DIR_KEY] do
+    @sources[HEADERS_KEY].each do | header |
+      print "\nprocessing '#{header}' - "
+      entities = `#{CTAGS_CMD_HEAD} "#{header}" #{CTAGS_CMD_TAIL}`.split "\n"
+      print "found (#{entities.size}) entities\n"
 
-        # parse CTAGS output
-        entities.each do | entity |
-          symbol , role , line_n , filename , prototype = (CTAGS_REGEX.match entity).captures
+      # parse CTAGS output
+      @sources[ENTITIES_KEY][header] = entities.map do | entity |
+        identifier , kind , line_n , filename , prototype = (CTAGS_REGEX.match entity).captures
 
-          # detect abstract/interface methods
-          first_match = (FIRST_TOKEN_REGEX.match prototype)
-          last_match  = (LAST_TOKEN_REGEX .match prototype)
-          first_token = first_match.nil? ? '' : first_match.captures[0]
-          last_token  = last_match .nil? ? '' : last_match .captures[0]
-          is_override = last_token  == 'override'
-          is_virtual  = first_token == 'virtual' && !is_override
+        # detect abstract/interface methods
+        first_match = (FIRST_TOKEN_REGEX.match prototype)
+        last_match  = (LAST_TOKEN_REGEX .match prototype)
+        first_token = (first_match.nil?) ? '' : first_match.captures[0]
+        last_token  = (last_match .nil?) ? '' : last_match .captures[0]
+        is_override = (last_token  == 'override'                     ) ? 1 : 0
+        is_virtual  = (first_token == 'virtual'  && is_override.zero?) ? 1 : 0
 
-          data_hash[ENTITIES_KEY][header].push
-          {
-            SYMBOL_KEY      => symbol      ,
-            ROLE_KEY        => role        ,
-            LINE_N_KEY      => line_n      ,
-            FILENAME_KEY    => filename    ,
-            PROTOTYPE_KEY   => prototype   ,
-            IS_OVERRIDE_KEY => is_override ,
-            IS_VIRTUAL_KEY  => is_virtual
-          }
+dDEBUG_TRACE_CTAG header , identifier , kind , line_n , filename , prototype , is_override , is_virtual
 
-dDEBUG_TRACE_CTAG header , symbol , role , line_n , filename , prototype , is_override , is_virtual
-        end
+        {
+          IDENTIFIER_KEY  => identifier .to_s ,
+          KIND_KEY        => kind       .to_s ,
+          LINE_N_KEY      => line_n     .to_i ,
+          FILENAME_KEY    => filename   .to_s ,
+          PROTOTYPE_KEY   => prototype  .to_s ,
+          IS_OVERRIDE_KEY => is_override.to_i ,
+          IS_VIRTUAL_KEY  => is_virtual .to_i
+        }
       end
     end
   end
@@ -165,3 +165,73 @@ end
 load_headers
 correlate_headers
 parse_ctags
+
+
+
+require 'sqlite3'
+def db_query method , query
+  begin
+    db = SQLite3::Database.open "#{DOC_DIR}/udoc.sqlite"
+    db.results_as_hash = true
+    db.execute CREATE_ENTITIES_TABLE_SQL
+    db.send method , query
+  rescue SQLite3::Exception => ex
+    puts "SQLite3::Exception: #{ex}"
+  ensure
+      db.close if db
+  end
+end
+
+def db_get_entity filename , identifier
+  db_query :get_first_row , "SELECT #{IDENTIFIER_KEY.to_s} FROM Entities "     +
+                            "WHERE '#{FILENAME_KEY  .to_s}' IS '#{filename}' " +
+                            "AND   '#{IDENTIFIER_KEY.to_s}' IS '#{identifier}' "
+end ;
+
+def add_entity entity_hash
+  entities = entity_hash.keys  .to_s.gsub /[\[:\]]/ , ''
+  values   = entity_hash.values.to_s.gsub /[\[:\]]/ , ''
+
+  db_query :execute , "INSERT INTO Entities(#{entities}) VALUES(#{values})"
+end
+
+db_query :get_first_value , "SELECT SQLITE_VERSION()"
+
+
+@sources[HEADERS_KEY].each do | header |
+  @sources[ENTITIES_KEY][header].each do | entity_hash |
+    filename   = entity_hash[FILENAME_KEY]
+    identifier = entity_hash[IDENTIFIER_KEY]
+    next unless db_get_entity filename , identifier
+
+    print "adding entity '#{identifier}' from header '#{filename}'\n"
+    add_entity entity_hash
+  end
+end
+
+
+p "N=" + (db_query :execute , "SELECT * FROM Entities ORDER BY #{LINE_N_KEY.to_s}").size.to_s
+
+
+(db_query :execute , "SELECT * FROM Entities ORDER BY #{LINE_N_KEY.to_s}").each do | entity_hash |
+
+# print "id          = #{entity_hash['id']}\n"
+# print "filename    = #{entity_hash[FILENAME_KEY.to_s]}\n"
+# print "line_n      = #{entity_hash[LINE_N_KEY.to_s]}\n"
+# print "identifier  = #{entity_hash[IDENTIFIER_KEY.to_s]}\n"
+# print "kind        = #{entity_hash[KIND_KEY.to_s]}\n"
+# print "is_override = #{entity_hash[IS_OVERRIDE_KEY.to_s]}\n"
+# print "is_virtual  = #{entity_hash[IS_VIRTUAL_KEY.to_s]}\n"
+# print "prototype   = #{entity_hash[PROTOTYPE_KEY.to_s]}\n"
+
+end
+
+
+
+
+
+
+
+
+
+
