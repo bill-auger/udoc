@@ -1,5 +1,7 @@
 #!/usr/bin/env ruby
 
+require          'sqlite3'
+require          'byebug'
 require_relative "udoc-debug"
 
 
@@ -10,54 +12,56 @@ CORRELATION_MSG      = " header files have corresponding documented headers\n"
 MISSING_SOURCE_MSG   = "the following documented headers are not represented in source directory:\n\t"
 ORPHAN_HEADER_PROMPT = "how would you like to resolve orphan "
 
-CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p " #   --recurse=[yes|no]
+CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p --extra=+q" #   --recurse=[yes|no]
 CTAGS_CMD_TAIL = " | sort -n -k 3"
 
-CTAGS_REGEX       = /^(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/
-LAST_TOKEN_REGEX  = /^.*\s+(\S+)\s*(;|{.*})\s*$/
-FIRST_TOKEN_REGEX = /^(\S+)\s+.*$/
-
-ENTITIES_FIELDS = "id     INTEGER PRIMARY KEY , filename TEXT , identifier TEXT , is_override INTEGER ,
-                   line_n INTEGER             , kind     TEXT , prototype  TEXT , is_virtual  INTEGER"
-CREATE_ENTITIES_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Entities(#{ENTITIES_FIELDS})"
+CTAGS_REGEX     = /^(\S+::\S+|\S+\.\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/ # '::' => C++, '.' => Eiffel and Java
+PROTOTYPE_REGEX = /^(\S+)\s+.*\s+(\S+)\s*(;|{.*})\s*$/
 
 DIR_KEY         = :headers_dir
 HEADERS_KEY     = :header_files
-ENTITIES_KEY    = :header_entities
-IDENTIFIER_KEY  = :identifier
-KIND_KEY        = :kind
-LINE_N_KEY      = :line_n
-FILENAME_KEY    = :filename
-PROTOTYPE_KEY   = :prototype
-IS_VIRTUAL_KEY  = :is_virtual
-IS_OVERRIDE_KEY = :is_override
+CTAGS_KEY       = :header_ctags
+FILENAME_KEY    = "filename"
+IDENTIFIER_KEY  = "identifier"
+LINE_N_KEY      = "line_n"
+KIND_KEY        = "kind"
+IS_OVERRIDE_KEY = "is_override"
+IS_VIRTUAL_KEY  = "is_virtual"
+PROTOTYPE_KEY   = "prototype"
+DOC_COMMENT_KEY = "doc_comment"
+IS_DIRTY_KEY    = "is_dirty"
+CTAGS_FIELDS    = "id     INTEGER PRIMARY KEY , #{FILENAME_KEY } TEXT , #{IDENTIFIER_KEY } TEXT , "    +
+                  "#{LINE_N_KEY     } INTEGER , #{KIND_KEY     } TEXT , #{IS_OVERRIDE_KEY} INTEGER , " +
+                  "#{IS_VIRTUAL_KEY } INTEGER , #{PROTOTYPE_KEY} TEXT , "                              +
+                  "#{DOC_COMMENT_KEY} TEXT    , #{IS_DIRTY_KEY } INTEGER"
+CREATE_CTAGS_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Tags(#{CTAGS_FIELDS})"
 
-ORPHANED_HEADER_HANDLERS = { 'b' => :backup_file    , 'd' => :delete_file   , 'r' => :rename_file   }
-ORPHANED_ENTITY_HANDLERS = { 'c' => :comment_entity , 'd' => :delete_entity , 'r' => :rename_entity }
+ORPHANED_HEADER_HANDLERS = { 'h' => :hide_file , 'd' => :delete_file , 'r' => :rename_file }
+ORPHANED_CTAG_HANDLERS   = { 'h' => :hide_ctag , 'd' => :delete_ctag , 'r' => :rename_ctag }
 
 
 p "cannot find SOURCE_DIR '#{SOURCE_DIR}'" and exit unless Dir.exist? SOURCE_DIR
 p "cannot find DOC_DIR '#{DOC_DIR}'"       and exit unless Dir.exist? DOC_DIR
 
-@source_headers  = []
-@doc_headers     = []
-@source_entities = {} # indexed by header
-@doc_entities    = {} # indexed by header
+@source_headers = []
+@doc_headers    = []
+@source_ctags   = {} # indexed by header
+@doc_ctags      = {} # indexed by header
 @undocumented_headers = []
 @orphaned_headers     = []
 @correlated_headers   = []
 @uncorrelated_headers = []
 @sources =
 {
-  DIR_KEY      => SOURCE_DIR       ,
-  HEADERS_KEY  => @source_headers  ,
-  ENTITIES_KEY => @source_entities ,
+  DIR_KEY     => SOURCE_DIR      ,
+  HEADERS_KEY => @source_headers ,
+  CTAGS_KEY   => @source_ctags
 }
 @docs =
 {
-  DIR_KEY      => DOC_DIR       ,
-  HEADERS_KEY  => @doc_headers  ,
-  ENTITIES_KEY => @doc_entities ,
+  DIR_KEY     => DOC_DIR      ,
+  HEADERS_KEY => @doc_headers ,
+  CTAGS_KEY   => @doc_ctags
 }
 
 
@@ -65,7 +69,7 @@ def load_headers
   [ @sources , @docs ].each do | data_hash |
     # scan directories for header files
     header_files = Dir.chdir(data_hash[DIR_KEY]) { Dir["*.h"] }
-    header_files.each { | header | data_hash[HEADERS_KEY].push header }
+    header_files.each { | filename | data_hash[HEADERS_KEY].push filename }
 
 dDEBUG_TRACE_N_HEADERS data_hash
 
@@ -82,14 +86,14 @@ def correlate_headers
 
   print "#{@correlated_headers.size}/#{@source_headers.size}#{CORRELATION_MSG}"
   print "#{MISSING_SOURCE_MSG}#{@orphaned_headers.join "\n\t"}\n" unless @orphaned_headers.empty?
-  until (header = @orphaned_headers.pop).nil?
-    print prompt = "#{ORPHAN_HEADER_PROMPT}'#{header}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: "
+  until (filename = @orphaned_headers.pop).nil?
+    print prompt = "#{ORPHAN_HEADER_PROMPT}'#{filename}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: "
     print prompt until ORPHANED_HEADER_HANDLERS.include? (choice = STDIN.gets.strip[0])
-    send ORPHANED_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{header}"
+    send ORPHANED_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{filename}"
   end
 
-  until (header = @undocumented_headers.pop).nil?
-    create_file "#{DOC_DIR}/#{header}"
+  until (filename = @undocumented_headers.pop).nil?
+    create_file "#{DOC_DIR}/#{filename}"
   end
 end
 
@@ -99,10 +103,10 @@ def create_file filename
   File.new filename , 'w' ; print "created file '#{filename}'\n" ;
 end
 
-def backup_file filename
+def hide_file filename
   return unless File.exist? filename
 
-  File.rename filename , "#{filename}.bak" ; print "backed up file '#{filename}'\n" ;
+  File.rename filename , "#{filename}.bak" ; print "renamed file '#{filename}' to #{filename}.bak\n" ;
 end
 
 def delete_file filename
@@ -113,7 +117,7 @@ end
 
 def rename_file old_filename
   i = 0 ; print prompt = "choose new filename:\n"                                                 +
-                ((@undocumented_headers.map { | header | "\t#{i = i + 1}) #{header}" }).join "\n") +
+                ((@undocumented_headers.map { | filename | "\t#{i = i + 1}) #{filename}" }).join "\n") +
                 "\n?: "
   print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
   new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
@@ -123,115 +127,119 @@ def rename_file old_filename
   File.rename old_filename , new_filename
 end
 
-def parse_ctags
+def parse_ctags filename
   # run CTAGS amd parse output for source headers
   Dir.chdir @sources[DIR_KEY] do
-    @sources[HEADERS_KEY].each do | header |
-      print "\nprocessing '#{header}' - "
-      entities = `#{CTAGS_CMD_HEAD} "#{header}" #{CTAGS_CMD_TAIL}`.split "\n"
-      print "found (#{entities.size}) entities\n"
+    print "processing '#{filename}' - "
+    ctags     = `#{CTAGS_CMD_HEAD} "#{filename}" #{CTAGS_CMD_TAIL}`.split "\n"
+    oop_ctags = (ctags.map { | ctag | CTAGS_REGEX.match ctag }).compact
+    print "found (#{oop_ctags.size}) OOP entities"
 
-      # parse CTAGS output
-      @sources[ENTITIES_KEY][header] = entities.map do | entity |
-        identifier , kind , line_n , filename , prototype = (CTAGS_REGEX.match entity).captures
+    # parse CTAGS output
+    @sources[CTAGS_KEY][filename] = oop_ctags.map do | ctag |
+      identifier , kind , line_n , filename , prototype = ctag.captures
 
-        # detect abstract/interface methods
-        first_match = (FIRST_TOKEN_REGEX.match prototype)
-        last_match  = (LAST_TOKEN_REGEX .match prototype)
-        first_token = (first_match.nil?) ? '' : first_match.captures[0]
-        last_token  = (last_match .nil?) ? '' : last_match .captures[0]
-        is_override = (last_token  == 'override'                     ) ? 1 : 0
-        is_virtual  = (first_token == 'virtual'  && is_override.zero?) ? 1 : 0
+      # detect abstract/interface methods
+      qualifiers  = PROTOTYPE_REGEX.match(prototype) {|m| m.captures } || []
+      is_override = (qualifiers[1] == 'override'                     ) ? 1 : 0
+      is_virtual  = (qualifiers[0] == 'virtual'  && is_override.zero?) ? 1 : 0
 
-dDEBUG_TRACE_CTAG header , identifier , kind , line_n , filename , prototype , is_override , is_virtual
+dDEBUG_TRACE_PARSE_CTAG filename , identifier , kind , line_n , filename , prototype , is_override , is_virtual
 
-        {
-          IDENTIFIER_KEY  => identifier .to_s ,
-          KIND_KEY        => kind       .to_s ,
-          LINE_N_KEY      => line_n     .to_i ,
-          FILENAME_KEY    => filename   .to_s ,
-          PROTOTYPE_KEY   => prototype  .to_s ,
-          IS_OVERRIDE_KEY => is_override.to_i ,
-          IS_VIRTUAL_KEY  => is_virtual .to_i
-        }
-      end
+      {
+        IDENTIFIER_KEY  => identifier .to_s ,
+        KIND_KEY        => kind       .to_s ,
+        LINE_N_KEY      => line_n     .to_i ,
+        FILENAME_KEY    => filename   .to_s ,
+        PROTOTYPE_KEY   => prototype  .to_s ,
+        IS_OVERRIDE_KEY => is_override.to_i ,
+        IS_VIRTUAL_KEY  => is_virtual .to_i ,
+        DOC_COMMENT_KEY => ''         .to_s ,
+        IS_DIRTY_KEY    => 0          .to_i
+      }
     end
+  end
+end
+
+def db_query method , query
+  result = nil
+  begin
+    db = SQLite3::Database.open "#{DOC_DIR}/udoc.sqlite"
+    db.results_as_hash = true
+    db.execute CREATE_CTAGS_TABLE_SQL
+
+    result = db.send method , query
+  rescue SQLite3::Exception => ex
+    print "SQLite3::Exception: #{ex}\n"
+  ensure
+    db.close if db
+  end
+
+  result
+end
+
+def db_read_ctag filename , identifier
+  db_query :get_first_row , "SELECT * FROM Tags "                   +
+                            "WHERE #{FILENAME_KEY  } IS '#{filename}' " +
+                            "AND   #{IDENTIFIER_KEY} IS '#{identifier}' "
+end
+
+def add_ctag ctag_hash
+  keys   = ctag_hash.keys  .to_s.gsub /[\["\]]/   , ''
+  values = ctag_hash.values.to_s.gsub /^\[(.*)\]/ , '\1'
+
+  print "adding ctag '#{ctag_hash[IDENTIFIER_KEY]}' from header '#{ctag_hash[FILENAME_KEY]}'\n"
+  db_query :execute , "INSERT INTO Tags(#{keys}) VALUES(#{values})"
+end
+
+def write_doc_files filename
+#   ctag_hashes = db_query :execute , "SELECT * FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
+  sql         = "SELECT #{IDENTIFIER_KEY} FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
+  ctag_hashes = (db_query :execute , sql) || []
+  print " - (#{ctag_hashes.size}) documented\n"
+  ctag_hashes.each do | ctag_hash |
+    # print "id          = #{ctag_hash['id']}\n"
+    # print "filename    = #{ctag_hash[FILENAME_KEY]}\n"
+    # print "line_n      = #{ctag_hash[LINE_N_KEY]}\n"
+    # print "identifier  = #{ctag_hash[IDENTIFIER_KEY]}\n"
+    # print "kind        = #{ctag_hash[KIND_KEY]}\n"
+    # print "is_override = #{ctag_hash[IS_OVERRIDE_KEY]}\n"
+    # print "is_virtual  = #{ctag_hash[IS_VIRTUAL_KEY]}\n"
+    # print "prototype   = #{ctag_hash[PROTOTYPE_KEY]}\n"
+  end
+
+
+
+  begin
+    doc_file = File.open "#{DOC_DIR}/#{filename}" , 'w'
+
+    @sources[CTAGS_KEY][filename].each do | ctag_hash |
+      identifier = ctag_hash[IDENTIFIER_KEY]
+      line_n     = ctag_hash[LINE_N_KEY    ]
+      prototype  = ctag_hash[PROTOTYPE_KEY ]
+      until ctag = (db_read_ctag filename , identifier) ; add_ctag ctag_hash ; end ;
+      is_dirty   = ctag[PROTOTYPE_KEY] != prototype || ctag[DOC_COMMENT_KEY].empty?
+      params     = "#{LINE_N_KEY  }='#{line_n            }', " +
+                  "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
+
+dDEBUG_TRACE_LOAD_CTAG ctag
+
+      db_query :execute , "UPDATE Tags SET #{params}"               +
+                          "WHERE #{FILENAME_KEY} IS '#{filename}' " +
+                          "AND #{IDENTIFIER_KEY} IS '#{identifier}' "
+
+      doc_file << "#{ctag[DOC_COMMENT_KEY]}\n#{ctag[PROTOTYPE_KEY]}\n\n"
+    end
+  rescue ; raise "I/O error writing to file '#{DOC_DIR}/#{filename}'" ;
+  ensure ; doc_file.close
   end
 end
 
 
 # main entry
 
+db_query :get_first_value , "SELECT SQLITE_VERSION()" # sanity check
+
 load_headers
 correlate_headers
-parse_ctags
-
-
-
-require 'sqlite3'
-def db_query method , query
-  begin
-    db = SQLite3::Database.open "#{DOC_DIR}/udoc.sqlite"
-    db.results_as_hash = true
-    db.execute CREATE_ENTITIES_TABLE_SQL
-    db.send method , query
-  rescue SQLite3::Exception => ex
-    puts "SQLite3::Exception: #{ex}"
-  ensure
-      db.close if db
-  end
-end
-
-def db_get_entity filename , identifier
-  db_query :get_first_row , "SELECT #{IDENTIFIER_KEY.to_s} FROM Entities "     +
-                            "WHERE '#{FILENAME_KEY  .to_s}' IS '#{filename}' " +
-                            "AND   '#{IDENTIFIER_KEY.to_s}' IS '#{identifier}' "
-end ;
-
-def add_entity entity_hash
-  entities = entity_hash.keys  .to_s.gsub /[\[:\]]/ , ''
-  values   = entity_hash.values.to_s.gsub /[\[:\]]/ , ''
-
-  db_query :execute , "INSERT INTO Entities(#{entities}) VALUES(#{values})"
-end
-
-db_query :get_first_value , "SELECT SQLITE_VERSION()"
-
-
-@sources[HEADERS_KEY].each do | header |
-  @sources[ENTITIES_KEY][header].each do | entity_hash |
-    filename   = entity_hash[FILENAME_KEY]
-    identifier = entity_hash[IDENTIFIER_KEY]
-    next unless db_get_entity filename , identifier
-
-    print "adding entity '#{identifier}' from header '#{filename}'\n"
-    add_entity entity_hash
-  end
-end
-
-
-p "N=" + (db_query :execute , "SELECT * FROM Entities ORDER BY #{LINE_N_KEY.to_s}").size.to_s
-
-
-(db_query :execute , "SELECT * FROM Entities ORDER BY #{LINE_N_KEY.to_s}").each do | entity_hash |
-
-# print "id          = #{entity_hash['id']}\n"
-# print "filename    = #{entity_hash[FILENAME_KEY.to_s]}\n"
-# print "line_n      = #{entity_hash[LINE_N_KEY.to_s]}\n"
-# print "identifier  = #{entity_hash[IDENTIFIER_KEY.to_s]}\n"
-# print "kind        = #{entity_hash[KIND_KEY.to_s]}\n"
-# print "is_override = #{entity_hash[IS_OVERRIDE_KEY.to_s]}\n"
-# print "is_virtual  = #{entity_hash[IS_VIRTUAL_KEY.to_s]}\n"
-# print "prototype   = #{entity_hash[PROTOTYPE_KEY.to_s]}\n"
-
-end
-
-
-
-
-
-
-
-
-
-
+@sources[HEADERS_KEY].each { | filename | parse_ctags filename ; write_doc_files filename ; }
