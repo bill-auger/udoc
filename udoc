@@ -8,9 +8,12 @@ require_relative "udoc-debug"
 SOURCE_DIR = 'Source'
 DOC_DIR    = 'Doc'
 
-CORRELATION_MSG      = " header files have corresponding documented headers\n"
-MISSING_SOURCE_MSG   = "the following documented headers are not represented in source directory:\n\t"
-ORPHAN_HEADER_PROMPT = "how would you like to resolve orphan "
+CORRELATED_HEADERS_MSG = " header files have corresponding documented headers\n"
+CORRELATED_CTAGS_MSG   = " entities have corresponding documentation\n"
+MISSING_HEADER_MSG     = "the following documented headers are not represented in source directory:\n\t"
+MISSING_CTAG_MSG       = "the following documented entities are not represented in source file:\n\t"
+ORPHAN_HEADER_PROMPT   = "how would you like to resolve orphaned header file "
+ORPHAN_CTAG_PROMPT     = "how would you like to resolve orphaned entity "
 
 CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p --extra=+q" #   --recurse=[yes|no]
 CTAGS_CMD_TAIL = " | sort -n -k 3"
@@ -30,14 +33,14 @@ IS_VIRTUAL_KEY  = "is_virtual"
 PROTOTYPE_KEY   = "prototype"
 DOC_COMMENT_KEY = "doc_comment"
 IS_DIRTY_KEY    = "is_dirty"
-CTAGS_FIELDS    = "id     INTEGER PRIMARY KEY , #{FILENAME_KEY } TEXT , #{IDENTIFIER_KEY } TEXT , "    +
-                  "#{LINE_N_KEY     } INTEGER , #{KIND_KEY     } TEXT , #{IS_OVERRIDE_KEY} INTEGER , " +
-                  "#{IS_VIRTUAL_KEY } INTEGER , #{PROTOTYPE_KEY} TEXT , "                              +
-                  "#{DOC_COMMENT_KEY} TEXT    , #{IS_DIRTY_KEY } INTEGER"
+CTAGS_FIELDS    = "id     INTEGER PRIMARY KEY , #{FILENAME_KEY   } TEXT    , #{IDENTIFIER_KEY} TEXT , " +
+                  "#{LINE_N_KEY     } INTEGER , #{KIND_KEY       } TEXT    , #{PROTOTYPE_KEY } TEXT , " +
+                  "#{IS_VIRTUAL_KEY } INTEGER , #{IS_OVERRIDE_KEY} INTEGER , "                          +
+                  "#{IS_DIRTY_KEY   } INTEGER , #{DOC_COMMENT_KEY} TEXT"
 CREATE_CTAGS_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Tags(#{CTAGS_FIELDS})"
 
-ORPHANED_HEADER_HANDLERS = { 'h' => :hide_file , 'd' => :delete_file , 'r' => :rename_file }
-ORPHANED_CTAG_HANDLERS   = { 'h' => :hide_ctag , 'd' => :delete_ctag , 'r' => :rename_ctag }
+ORPHAN_HEADER_HANDLERS = { 'h' => :hide_file , 'd' => :delete_file , 'r' => :rename_file }
+ORPHAN_CTAG_HANDLERS   = { 'h' => :hide_ctag , 'd' => :delete_ctag , 'r' => :rename_ctag }
 
 
 p "cannot find SOURCE_DIR '#{SOURCE_DIR}'" and exit unless Dir.exist? SOURCE_DIR
@@ -47,10 +50,6 @@ p "cannot find DOC_DIR '#{DOC_DIR}'"       and exit unless Dir.exist? DOC_DIR
 @doc_headers    = []
 @source_ctags   = {} # indexed by header
 @doc_ctags      = {} # indexed by header
-@undocumented_headers = []
-@orphaned_headers     = []
-@correlated_headers   = []
-@uncorrelated_headers = []
 @sources =
 {
   DIR_KEY     => SOURCE_DIR      ,
@@ -79,20 +78,19 @@ end
 
 def correlate_headers
   # compare source headers to documented headers
-  @undocumented_headers = @source_headers       - @doc_headers
-  @orphaned_headers     = @doc_headers          - @source_headers
-  @correlated_headers   = @source_headers       & @doc_headers
-  @uncorrelated_headers = @undocumented_headers + @orphaned_headers
+  undocumented_headers = @source_headers       - @doc_headers
+  orphaned_headers     = @doc_headers          - @source_headers
+  correlated_headers   = @source_headers       & @doc_headers
 
-  print "#{@correlated_headers.size}/#{@source_headers.size}#{CORRELATION_MSG}"
-  print "#{MISSING_SOURCE_MSG}#{@orphaned_headers.join "\n\t"}\n" unless @orphaned_headers.empty?
-  until (filename = @orphaned_headers.pop).nil?
-    print prompt = "#{ORPHAN_HEADER_PROMPT}'#{filename}' ?\n#{ORPHANED_HEADER_HANDLERS.to_s}\n?: "
-    print prompt until ORPHANED_HEADER_HANDLERS.include? (choice = STDIN.gets.strip[0])
-    send ORPHANED_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{filename}"
+  print "#{correlated_headers.size}/#{@source_headers.size}#{CORRELATED_HEADERS_MSG}"
+  print "#{MISSING_HEADER_MSG}#{orphaned_headers.join "\n\t"}\n" unless orphaned_headers.empty?
+  until (filename = orphaned_headers.pop).nil?
+    print prompt = "#{ORPHAN_HEADER_PROMPT}'#{filename}' ?\n#{ORPHAN_HEADER_HANDLERS.to_s}\n?: "
+    print prompt until ORPHAN_HEADER_HANDLERS.include? (choice = STDIN.gets.strip[0])
+    send ORPHAN_HEADER_HANDLERS[choice] , "#{DOC_DIR}/#{filename}" , undocumented_headers
   end
 
-  until (filename = @undocumented_headers.pop).nil?
+  until (filename = undocumented_headers.pop).nil?
     create_file "#{DOC_DIR}/#{filename}"
   end
 end
@@ -104,9 +102,7 @@ def create_file filename
 end
 
 def hide_file filename
-  return unless File.exist? filename
-
-  File.rename filename , "#{filename}.bak" ; print "renamed file '#{filename}' to #{filename}.bak\n" ;
+  rename_file filename , "#{filename}.bak"
 end
 
 def delete_file filename
@@ -115,20 +111,22 @@ def delete_file filename
   File.delete filename ; print "deleted file '#{filename}'\n" ;
 end
 
-def rename_file old_filename
-  i = 0 ; print prompt = "choose new filename:\n"                                                 +
-                ((@undocumented_headers.map { | filename | "\t#{i = i + 1}) #{filename}" }).join "\n") +
-                "\n?: "
-  print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
-  new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
-  return unless (File.exists? old_filename) && !(File.exists? new_filename)
+def rename_file old_filename , new_filename , undocumented_headers = []
+  unless undocumented_headers.empty?
+    i = 0 ; print prompt = "choose new filename:\n"                                                 +
+                  ((undocumented_headers.map { | filename | "\t#{i = i + 1}) #{filename}" }).join "\n") +
+                  "\n?: "
+    print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
+    new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
+  end
+  return unless File.exists? old_filename
 
-  print "renaming file '#{old_filename}' to '#{new_filename}'\n"
   File.rename old_filename , new_filename
+  print "renamed file '#{old_filename}' to '#{new_filename}'\n"
 end
 
-def parse_ctags filename
-  # run CTAGS amd parse output for source headers
+def load_ctags filename
+  # run CTAGS on a source header and parse output
   Dir.chdir @sources[DIR_KEY] do
     print "processing '#{filename}' - "
     ctags     = `#{CTAGS_CMD_HEAD} "#{filename}" #{CTAGS_CMD_TAIL}`.split "\n"
@@ -147,21 +145,26 @@ def parse_ctags filename
 dDEBUG_TRACE_PARSE_CTAG filename , identifier , kind , line_n , filename , prototype , is_override , is_virtual
 
       {
-        IDENTIFIER_KEY  => identifier .to_s ,
-        KIND_KEY        => kind       .to_s ,
-        LINE_N_KEY      => line_n     .to_i ,
         FILENAME_KEY    => filename   .to_s ,
+        IDENTIFIER_KEY  => identifier .to_s ,
+        LINE_N_KEY      => line_n     .to_i ,
+        KIND_KEY        => kind       .to_s ,
         PROTOTYPE_KEY   => prototype  .to_s ,
-        IS_OVERRIDE_KEY => is_override.to_i ,
         IS_VIRTUAL_KEY  => is_virtual .to_i ,
-        DOC_COMMENT_KEY => ''         .to_s ,
-        IS_DIRTY_KEY    => 0          .to_i
+        IS_OVERRIDE_KEY => is_override.to_i ,
+        IS_DIRTY_KEY    => 0          .to_i ,
+        DOC_COMMENT_KEY => ''         .to_s
       }
     end
   end
+
+  # load previously documented tags from db
+  sql              = "SELECT * FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
+  @docs[CTAGS_KEY] = db_query :execute , sql || []
+  print " - (#{@docs[CTAGS_KEY].size}) documented\n"
 end
 
-def db_query method , query
+def db_query method , query , on_success_msg = ''
   result = nil
   begin
     db = SQLite3::Database.open "#{DOC_DIR}/udoc.sqlite"
@@ -169,6 +172,7 @@ def db_query method , query
     db.execute CREATE_CTAGS_TABLE_SQL
 
     result = db.send method , query
+    print on_success_msg unless on_success_msg.empty?
   rescue SQLite3::Exception => ex
     print "SQLite3::Exception: #{ex}\n"
   ensure
@@ -179,7 +183,7 @@ def db_query method , query
 end
 
 def db_read_ctag filename , identifier
-  db_query :get_first_row , "SELECT * FROM Tags "                   +
+  db_query :get_first_row , "SELECT * FROM Tags "                       +
                             "WHERE #{FILENAME_KEY  } IS '#{filename}' " +
                             "AND   #{IDENTIFIER_KEY} IS '#{identifier}' "
 end
@@ -192,24 +196,57 @@ def add_ctag ctag_hash
   db_query :execute , "INSERT INTO Tags(#{keys}) VALUES(#{values})"
 end
 
-def write_doc_files filename
-#   ctag_hashes = db_query :execute , "SELECT * FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
-  sql         = "SELECT #{IDENTIFIER_KEY} FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
-  ctag_hashes = (db_query :execute , sql) || []
-  print " - (#{ctag_hashes.size}) documented\n"
-  ctag_hashes.each do | ctag_hash |
-    # print "id          = #{ctag_hash['id']}\n"
-    # print "filename    = #{ctag_hash[FILENAME_KEY]}\n"
-    # print "line_n      = #{ctag_hash[LINE_N_KEY]}\n"
-    # print "identifier  = #{ctag_hash[IDENTIFIER_KEY]}\n"
-    # print "kind        = #{ctag_hash[KIND_KEY]}\n"
-    # print "is_override = #{ctag_hash[IS_OVERRIDE_KEY]}\n"
-    # print "is_virtual  = #{ctag_hash[IS_VIRTUAL_KEY]}\n"
-    # print "prototype   = #{ctag_hash[PROTOTYPE_KEY]}\n"
+def correlate_ctags filename
+  # compare source entities to documented entities
+  source_ctags = @sources[CTAGS_KEY][filename]
+  doc_ctags    = @docs   [CTAGS_KEY][filename]
+  source_ids   = source_ctags.map { | ctag | ctag[IDENTIFIER_KEY] }
+  doc_ids      = doc_ctags   .map { | ctag | ctag[IDENTIFIER_KEY] }
+  undocumented_ids   = source_ids       - doc_ids
+  orphaned_ids       = doc_ids          - source_ids
+  correlated_ids     = source_ids       & doc_ids
+  undocumented_ctags = undocumented_ids.map { | id | source_ctags[source_ids.index id] }
+#   undocumented_ctags = source_ctags.select { | ctag | undocumented_ids.include? ctag[IDENTIFIER_KEY]}
+
+  print "#{correlated_ctags.size}/#{source_ctags.size}#{CORRELATED_TAGS_MSG}"
+  print "#{MISSING_TAG_MSG}#{orphaned_ctags.join "\n\t"}\n" unless orphaned_ctags.empty?
+  while identifier = orphaned_ctags.pop
+    print prompt = "#{ORPHAN_CTAG_PROMPT}'#{filename}' ?\n#{ORPHAN_CTAG_HANDLERS.to_s}\n?: "
+    print prompt until ORPHAN_CTAG_HANDLERS.include? (choice = STDIN.gets.strip[0])
+    send ORPHAN_CTAG_HANDLERS[choice] , filename , identifier , '' , undocumented_ids
   end
 
+  add_ctag ctag_hash while ctag_hash = undocumented_ctags.pop
+end
 
+def hide_ctag filename , identifier
+  return if identifier.includes? HIDDEN_SENTINEL
 
+  rename_ctag filename , identifier , identifier + HIDDEN_SENTINEL
+end
+
+def delete_ctag filename , identifier
+  db_query :execute , "DELETE FROM Tags "                               +
+                      "WHERE #{FILENAME_KEY  } IS '#{filename      }' " +
+                      "AND   #{IDENTIFIER_KEY} IS '#{old_identifier}'"  ,
+           "deleted entity '#{identifier}'\n" ;
+end
+
+def rename_ctag filename , old_identifier , new_identifier , undocumented_ids
+  unless undocumented_ids.empty?
+    i = 0 ; ids = (undocumented_ids.map { | id | "\t#{i = i + 1}) #{id}" }).join "\n" ;
+    print prompt = "choose new identifier:\n#{ids}\n?: "
+    print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= undocumented_ids.size
+    new_identifier = "#{DOC_DIR}/#{undocumented_ids[choice - 1]}"
+  end
+
+  db_query :execute , "UPDATE Tags SET #{identifier}='#{new_identifier}'" +
+                      "WHERE #{FILENAME_KEY  } IS '#{filename      }' "   +
+                      "AND   #{IDENTIFIER_KEY} IS '#{old_identifier}'"    ,
+           "renamed entity '#{old_identifier}' to '#{new_identifier}'\n"
+end
+
+def write_doc_files filename
   begin
     doc_file = File.open "#{DOC_DIR}/#{filename}" , 'w'
 
@@ -217,10 +254,10 @@ def write_doc_files filename
       identifier = ctag_hash[IDENTIFIER_KEY]
       line_n     = ctag_hash[LINE_N_KEY    ]
       prototype  = ctag_hash[PROTOTYPE_KEY ]
-      until ctag = (db_read_ctag filename , identifier) ; add_ctag ctag_hash ; end ;
+      ctag       = db_read_ctag filename , identifier
       is_dirty   = ctag[PROTOTYPE_KEY] != prototype || ctag[DOC_COMMENT_KEY].empty?
       params     = "#{LINE_N_KEY  }='#{line_n            }', " +
-                  "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
+                   "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
 
 dDEBUG_TRACE_LOAD_CTAG ctag
 
@@ -242,4 +279,8 @@ db_query :get_first_value , "SELECT SQLITE_VERSION()" # sanity check
 
 load_headers
 correlate_headers
-@sources[HEADERS_KEY].each { | filename | parse_ctags filename ; write_doc_files filename ; }
+@sources[HEADERS_KEY].each do | filename |
+  load_ctags      filename
+  correlate_ctags filename
+  write_doc_files filename
+end
