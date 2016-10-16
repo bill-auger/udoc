@@ -14,6 +14,7 @@ MISSING_HEADER_MSG     = "the following documented headers are not represented i
 MISSING_CTAG_MSG       = "the following documented entities are not represented in their source files:\n\t"
 ORPHAN_HEADER_PROMPT   = "how would you like to resolve orphaned header file "
 ORPHAN_CTAG_PROMPT     = "how would you like to resolve orphaned entity "
+DOC_COMMENT_INDENT     = "  "
 
 CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p --extra=+q" #   --recurse=[yes|no]
 CTAGS_CMD_TAIL = " | sort -n -k 3"
@@ -24,6 +25,7 @@ MEMBER_KIND_REGEX          = /^(\S+::\S+|\S+\.\S+)$/ # '::' => C++ , '.' => Eiff
 PROTOTYPE_INLINE_REGEX     = /{.*}/
 PROTOTYPE_COMMENT_REGEX    = /(\/\/.*)|(\/\*(.*?\*\/|.*))/
 PROTOTYPE_SPECIFIER_REGEX  = /^(\S+)\s+.*\s+(\S+)\s*(;|{.*})\s*$/
+INDENT_PAD_REGEX           = /^(\s*)\S+.*$/
 HIDDEN_CTAG_SENTINEL       = '[HIDDEN]'
 UNDOCUMENTED_CTAG_SENTINEL = '[TODO]'
 
@@ -87,7 +89,7 @@ def load_ctags filename
   source_ctags = Dir.chdir SOURCE_DIR do
     print "processing '#{filename}' - "
     ctags     = `#{CTAGS_CMD_HEAD} "#{filename}" #{CTAGS_CMD_TAIL}`.split "\n"
-    oop_ctags = (ctags.map { | ctag | CTAGS_REGEX.match ctag }).compact
+    oop_ctags = (ctags.map { | ctag | ctag.match CTAGS_REGEX }).compact
 
     # parse CTAGS output
     oop_ctags.map do | ctag |
@@ -99,15 +101,15 @@ def load_ctags filename
       prototype.strip!
 
       # detect abstract/interface methods
-      qualifiers  = PROTOTYPE_SPECIFIER_REGEX.match(prototype) {|m| m.captures } || []
+      qualifiers  = prototype.match(PROTOTYPE_SPECIFIER_REGEX) {|m| m.captures } || []
       is_override = (qualifiers[1] == 'override'                     ) ? 1 : 0
       is_virtual  = (qualifiers[0] == 'virtual'  && is_override.zero?) ? 1 : 0
 
 dDEBUG_TRACE_PARSE_CTAG filename , identifier , line_n , kind , prototype , is_virtual , is_override
 
-      (  CLASS_KIND_REGEX .match kind      ) || # containers
-      (  MEMBER_KIND_REGEX.match identifier) && # members via `ctags --extra=+q`
-      (! MEMBER_KIND_REGEX.match prototype )  ? # out-of-class definitions
+      (  kind      .match CLASS_KIND_REGEX ) || # containers
+      (  identifier.match MEMBER_KIND_REGEX) && # members via `ctags --extra=+q`
+      (! prototype .match MEMBER_KIND_REGEX)  ? # out-of-class definitions
       {
         FILENAME_KEY    => filename                  .to_s ,
         IDENTIFIER_KEY  => identifier                .to_s ,
@@ -149,6 +151,28 @@ def correlate_ctags filename , source_ctags , doc_ctags
   undocumented_ids.each { | id | add_ctag source_ctags[source_ids.index id] }
 end
 
+def update_db filename , source_ctags
+  source_ctags.each do | source_ctag_hash |
+    identifier    = source_ctag_hash[IDENTIFIER_KEY]
+    line_n        = source_ctag_hash[LINE_N_KEY    ]
+    prototype     = source_ctag_hash[PROTOTYPE_KEY ]
+    doc_ctag_hash = db_read_ctag filename , identifier
+    doc_comment   = doc_ctag_hash[DOC_COMMENT_KEY]
+    doc_prototype = doc_ctag_hash[PROTOTYPE_KEY  ]
+    is_dirty      = doc_prototype != prototype || doc_comment == UNDOCUMENTED_CTAG_SENTINEL
+    params        = "#{LINE_N_KEY  }='#{line_n            }', " +
+                    "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
+
+dDEBUG_TRACE_LOAD_CTAG doc_ctag_hash
+
+    db_query :execute , "UPDATE Tags SET #{params}"                 +
+                        "WHERE #{FILENAME_KEY} IS '#{filename  }' " +
+                        "AND #{IDENTIFIER_KEY} IS '#{identifier}'"
+
+    print "\tdocumentation requires updating for '#{identifier}'\n" if is_dirty
+  end
+end
+
 def write_doc_files filename , source_ctags
   print "writing documentation header file '#{DOC_DIR}/#{filename}'\n"
   begin
@@ -157,27 +181,18 @@ def write_doc_files filename , source_ctags
 
     source_ctags.reverse.each do | source_ctag_hash |
       identifier    = source_ctag_hash[IDENTIFIER_KEY]
-      line_n        = source_ctag_hash[LINE_N_KEY    ]
-      prototype     = source_ctag_hash[PROTOTYPE_KEY ]
+      line_n        = source_ctag_hash[LINE_N_KEY    ] - 1
       doc_ctag_hash = db_read_ctag filename , identifier
-      doc_comment   = doc_ctag_hash[DOC_COMMENT_KEY]
-      doc_prototype = doc_ctag_hash[PROTOTYPE_KEY  ]
-      is_dirty      = doc_prototype != prototype || doc_comment == UNDOCUMENTED_CTAG_SENTINEL
-      params        = "#{LINE_N_KEY  }='#{line_n            }', " +
-                      "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
+      doc_comment   = doc_ctag_hash[DOC_COMMENT_KEY].split "\n"
+      is_dirty      = doc_ctag_hash[IS_DIRTY_KEY   ]
 
-dDEBUG_TRACE_LOAD_CTAG doc_ctag_hash
+      # align doc comment indentation with input
+      pad = (header_lines[line_n].match INDENT_PAD_REGEX).captures[0]
+      doc_comment.map! { | line | "#{pad}#{DOC_COMMENT_INDENT}#{line}\n" }
 
-      db_query :execute , "UPDATE Tags SET #{params}"                 +
-                          "WHERE #{FILENAME_KEY} IS '#{filename  }' " +
-                          "AND #{IDENTIFIER_KEY} IS '#{identifier}'"
-
-      header_lines[line_n - 1 , 0] = [ "/**\n" , "#{doc_comment}\n" , "*/\n" ]
-
-      print "\tdocumentation requires updating for '#{identifier}'\n" if is_dirty
+      header_lines[line_n , 0] = [ "#{pad}/**\n" ] + doc_comment + [ "#{pad}*/\n" ]
     end
     header_lines.each { | line | doc_header << line }
-
   rescue ; print "I/O error writing to file '#{DOC_DIR}/#{filename}'" ;
   ensure ; doc_header.close unless doc_header.nil?
   end
@@ -292,5 +307,6 @@ source_headers.each do | filename |
   source_ctags , doc_ctags = load_ctags filename
 
   correlate_ctags filename , source_ctags , doc_ctags
+  update_db       filename , source_ctags
   write_doc_files filename , source_ctags
 end
