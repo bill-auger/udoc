@@ -18,71 +18,54 @@ ORPHAN_CTAG_PROMPT     = "how would you like to resolve orphaned entity "
 CTAGS_CMD_HEAD = "ctags -x --c-kinds=-d+p --extra=+q" #   --recurse=[yes|no]
 CTAGS_CMD_TAIL = " | sort -n -k 3"
 
-CTAGS_REGEX     = /^(\S+::\S+|\S+\.\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/ # '::' => C++, '.' => Eiffel and Java
-PROTOTYPE_REGEX = /^(\S+)\s+.*\s+(\S+)\s*(;|{.*})\s*$/
+CTAGS_REGEX               = /^(\S+::\S+|\S+\.\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(.*)/ # '::' => C++ , '.' => Eiffel and Java
+PROTOTYPE_INLINE_REGEX    = /{.*}/
+PROTOTYPE_COMMENT_REGEX   = /(\/\/.*)|(\/\*(.*?\*\/|.*))/
+PROTOTYPE_SPECIFIER_REGEX = /^(\S+)\s+.*\s+(\S+)\s*(;|{.*})\s*$/
 
-DIR_KEY         = :headers_dir
-HEADERS_KEY     = :header_files
-CTAGS_KEY       = :header_ctags
-FILENAME_KEY    = "filename"
-IDENTIFIER_KEY  = "identifier"
-LINE_N_KEY      = "line_n"
-KIND_KEY        = "kind"
-IS_OVERRIDE_KEY = "is_override"
-IS_VIRTUAL_KEY  = "is_virtual"
-PROTOTYPE_KEY   = "prototype"
-DOC_COMMENT_KEY = "doc_comment"
-IS_DIRTY_KEY    = "is_dirty"
-CTAGS_FIELDS    = "id     INTEGER PRIMARY KEY , #{FILENAME_KEY   } TEXT    , #{IDENTIFIER_KEY} TEXT , " +
-                  "#{LINE_N_KEY     } INTEGER , #{KIND_KEY       } TEXT    , #{PROTOTYPE_KEY } TEXT , " +
-                  "#{IS_VIRTUAL_KEY } INTEGER , #{IS_OVERRIDE_KEY} INTEGER , "                          +
-                  "#{IS_DIRTY_KEY   } INTEGER , #{DOC_COMMENT_KEY} TEXT"
-CREATE_CTAGS_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Tags(#{CTAGS_FIELDS})"
-
+FILENAME_KEY           = 'filename'
+IDENTIFIER_KEY         = 'identifier'
+LINE_N_KEY             = 'line_n'
+KIND_KEY               = 'kind'
+IS_OVERRIDE_KEY        = 'is_override'
+IS_VIRTUAL_KEY         = 'is_virtual'
+PROTOTYPE_KEY          = 'prototype'
+DOC_COMMENT_KEY        = 'doc_comment'
+IS_DIRTY_KEY           = 'is_dirty'
+HIDDEN_CTAG_SENTINEL   = '[HIDDEN]'
+CREATE_CTAGS_TABLE_SQL = "CREATE TABLE IF NOT EXISTS Tags(id INTEGER PRIMARY KEY , " +
+                         "#{FILENAME_KEY  } TEXT    , #{IDENTIFIER_KEY } TEXT    , " +
+                         "#{LINE_N_KEY    } INTEGER , #{KIND_KEY       } TEXT    , " +
+                         "#{PROTOTYPE_KEY } TEXT    , "                              +
+                         "#{IS_VIRTUAL_KEY} INTEGER , #{IS_OVERRIDE_KEY} INTEGER , " +
+                         "#{IS_DIRTY_KEY  } INTEGER , #{DOC_COMMENT_KEY} TEXT    )"
 ORPHAN_HEADER_HANDLERS = { 'h' => :hide_file , 'd' => :delete_file , 'r' => :rename_file }
 ORPHAN_CTAG_HANDLERS   = { 'h' => :hide_ctag , 'd' => :delete_ctag , 'r' => :rename_ctag }
+
 
 
 p "cannot find SOURCE_DIR '#{SOURCE_DIR}'" and exit unless Dir.exist? SOURCE_DIR
 p "cannot find DOC_DIR '#{DOC_DIR}'"       and exit unless Dir.exist? DOC_DIR
 
-@source_headers = []
-@doc_headers    = []
-@source_ctags   = {} # indexed by header
-@doc_ctags      = {} # indexed by header
-@sources =
-{
-  DIR_KEY     => SOURCE_DIR      ,
-  HEADERS_KEY => @source_headers ,
-  CTAGS_KEY   => @source_ctags
-}
-@docs =
-{
-  DIR_KEY     => DOC_DIR      ,
-  HEADERS_KEY => @doc_headers ,
-  CTAGS_KEY   => @doc_ctags
-}
-
 
 def load_headers
-  [ @sources , @docs ].each do | data_hash |
+  [ SOURCE_DIR , DOC_DIR ].map do | directory |
     # scan directories for header files
-    header_files = Dir.chdir(data_hash[DIR_KEY]) { Dir["*.h"] }
-    header_files.each { | filename | data_hash[HEADERS_KEY].push filename }
+    headers = Dir.chdir(directory) { Dir["*.h"] }
 
-dDEBUG_TRACE_N_HEADERS data_hash
+dDEBUG_TRACE_N_HEADERS headers , directory
 
-    data_hash[HEADERS_KEY].uniq!
+    headers.uniq
   end
 end
 
-def correlate_headers
+def correlate_headers source_headers , doc_headers
   # compare source headers to documented headers
-  undocumented_headers = @source_headers       - @doc_headers
-  orphaned_headers     = @doc_headers          - @source_headers
-  correlated_headers   = @source_headers       & @doc_headers
+  correlated_headers   = source_headers & doc_headers
+  orphaned_headers     = doc_headers    - source_headers
+  undocumented_headers = source_headers - doc_headers
 
-  print "#{correlated_headers.size}/#{@source_headers.size}#{CORRELATED_HEADERS_MSG}"
+  print "#{correlated_headers.size}/#{source_headers.size}#{CORRELATED_HEADERS_MSG}"
   print "#{MISSING_HEADER_MSG}#{orphaned_headers.join "\n\t"}\n" unless orphaned_headers.empty?
   until (filename = orphaned_headers.pop).nil?
     print prompt = "#{ORPHAN_HEADER_PROMPT}'#{filename}' ?\n#{ORPHAN_HEADER_HANDLERS.to_s}\n?: "
@@ -94,6 +77,99 @@ def correlate_headers
     create_file "#{DOC_DIR}/#{filename}"
   end
 end
+
+def load_ctags filename
+  # run CTAGS on a source header and parse output
+  source_ctags = Dir.chdir SOURCE_DIR do
+    print "processing '#{filename}' - "
+    ctags     = `#{CTAGS_CMD_HEAD} "#{filename}" #{CTAGS_CMD_TAIL}`.split "\n"
+    oop_ctags = (ctags.map { | ctag | CTAGS_REGEX.match ctag }).compact
+    print "found (#{oop_ctags.size}) OOP entities"
+
+    # parse CTAGS output
+    oop_ctags.map do | ctag |
+      identifier , kind , line_n , filename , prototype = ctag.captures
+
+      # normalize prototype
+      prototype.gsub! PROTOTYPE_INLINE_REGEX  , "{}" # supress '::' in definition
+      prototype.gsub! PROTOTYPE_COMMENT_REGEX , ""   # suppress  '::' in comments
+      prototype.strip!
+
+      # detect abstract/interface methods
+      qualifiers  = PROTOTYPE_SPECIFIER_REGEX.match(prototype) {|m| m.captures } || []
+      is_override = (qualifiers[1] == 'override'                     ) ? 1 : 0
+      is_virtual  = (qualifiers[0] == 'virtual'  && is_override.zero?) ? 1 : 0
+
+dDEBUG_TRACE_PARSE_CTAG filename , identifier , line_n , kind , prototype , is_virtual , is_override
+
+      {
+        FILENAME_KEY    => filename   .to_s ,
+        IDENTIFIER_KEY  => identifier .to_s ,
+        LINE_N_KEY      => line_n     .to_i ,
+        KIND_KEY        => kind       .to_s ,
+        PROTOTYPE_KEY   => prototype  .to_s ,
+        IS_VIRTUAL_KEY  => is_virtual .to_i ,
+        IS_OVERRIDE_KEY => is_override.to_i ,
+        IS_DIRTY_KEY    => 0          .to_i ,
+        DOC_COMMENT_KEY => ''         .to_s
+      }
+    end
+  end
+
+  # load previously documented tags from db
+  doc_ctags = db_query :execute , "SELECT * FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'" || []
+  print " - (#{doc_ctags.size}) documented\n"
+
+  [ source_ctags , doc_ctags ]
+end
+
+def correlate_ctags filename , source_ctags , doc_ctags
+  # compare source entities to documented entities
+  source_ids         = source_ctags.map { | ctag | ctag[IDENTIFIER_KEY] }
+  doc_ids            = doc_ctags   .map { | ctag | ctag[IDENTIFIER_KEY] }
+  correlated_ids     = source_ids & doc_ids
+  undocumented_ids   = source_ids - doc_ids
+  orphaned_ids       = doc_ids    - source_ids
+
+  print "#{correlated_ids.size}/#{source_ids.size}#{CORRELATED_CTAGS_MSG}"
+  print "#{MISSING_CTAG_MSG}#{orphaned_ids.join "\n\t"}\n" unless orphaned_ids.empty?
+  while identifier = orphaned_ids.pop
+    print prompt = "#{ORPHAN_CTAG_PROMPT}'#{identifier}' ?\n#{ORPHAN_CTAG_HANDLERS.to_s}\n?: "
+    print prompt until ORPHAN_CTAG_HANDLERS.include? (choice = STDIN.gets.strip[0])
+    send ORPHAN_CTAG_HANDLERS[choice] , filename , identifier , '' , undocumented_ids
+  end
+
+  undocumented_ids.each { | id | add_ctag source_ctags[source_ids.index id] }
+end
+
+def write_doc_files filename , source_ctags
+  begin
+    doc_file = File.open "#{DOC_DIR}/#{filename}" , 'w'
+
+    source_ctags.each do | ctag_hash |
+      identifier = ctag_hash[IDENTIFIER_KEY]
+      line_n     = ctag_hash[LINE_N_KEY    ]
+      prototype  = ctag_hash[PROTOTYPE_KEY ]
+      ctag       = db_read_ctag filename , identifier
+      is_dirty   = ctag[PROTOTYPE_KEY] != prototype || ctag[DOC_COMMENT_KEY].empty?
+      params     = "#{LINE_N_KEY  }='#{line_n            }', " +
+                   "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
+
+dDEBUG_TRACE_LOAD_CTAG ctag
+
+      db_query :execute , "UPDATE Tags SET #{params}"               +
+                          "WHERE #{FILENAME_KEY} IS '#{filename}' " +
+                          "AND #{IDENTIFIER_KEY} IS '#{identifier}' "
+
+      doc_file << "#{ctag[DOC_COMMENT_KEY]}\n#{ctag[PROTOTYPE_KEY]}\n\n"
+    end
+  rescue ; raise "I/O error writing to file '#{DOC_DIR}/#{filename}'" ;
+  ensure ; doc_file.close
+  end
+end
+
+
+## helpers ##
 
 def create_file filename
   return if File.exist? filename
@@ -116,52 +192,13 @@ def rename_file old_filename , new_filename , undocumented_headers = []
     i = 0 ; print prompt = "choose new filename:\n"                                                 +
                   ((undocumented_headers.map { | filename | "\t#{i = i + 1}) #{filename}" }).join "\n") +
                   "\n?: "
-    print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= @undocumented_headers.size
-    new_filename = "#{DOC_DIR}/#{@undocumented_headers[choice - 1]}"
+    print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= undocumented_headers.size
+    new_filename = "#{DOC_DIR}/#{undocumented_headers[choice - 1]}"
   end
   return unless File.exists? old_filename
 
   File.rename old_filename , new_filename
   print "renamed file '#{old_filename}' to '#{new_filename}'\n"
-end
-
-def load_ctags filename
-  # run CTAGS on a source header and parse output
-  Dir.chdir @sources[DIR_KEY] do
-    print "processing '#{filename}' - "
-    ctags     = `#{CTAGS_CMD_HEAD} "#{filename}" #{CTAGS_CMD_TAIL}`.split "\n"
-    oop_ctags = (ctags.map { | ctag | CTAGS_REGEX.match ctag }).compact
-    print "found (#{oop_ctags.size}) OOP entities"
-
-    # parse CTAGS output
-    @sources[CTAGS_KEY][filename] = oop_ctags.map do | ctag |
-      identifier , kind , line_n , filename , prototype = ctag.captures
-
-      # detect abstract/interface methods
-      qualifiers  = PROTOTYPE_REGEX.match(prototype) {|m| m.captures } || []
-      is_override = (qualifiers[1] == 'override'                     ) ? 1 : 0
-      is_virtual  = (qualifiers[0] == 'virtual'  && is_override.zero?) ? 1 : 0
-
-dDEBUG_TRACE_PARSE_CTAG filename , identifier , kind , line_n , filename , prototype , is_override , is_virtual
-
-      {
-        FILENAME_KEY    => filename   .to_s ,
-        IDENTIFIER_KEY  => identifier .to_s ,
-        LINE_N_KEY      => line_n     .to_i ,
-        KIND_KEY        => kind       .to_s ,
-        PROTOTYPE_KEY   => prototype  .to_s ,
-        IS_VIRTUAL_KEY  => is_virtual .to_i ,
-        IS_OVERRIDE_KEY => is_override.to_i ,
-        IS_DIRTY_KEY    => 0          .to_i ,
-        DOC_COMMENT_KEY => ''         .to_s
-      }
-    end
-  end
-
-  # load previously documented tags from db
-  sql              = "SELECT * FROM Tags WHERE #{FILENAME_KEY} IS '#{filename}'"
-  @docs[CTAGS_KEY] = db_query :execute , sql || []
-  print " - (#{@docs[CTAGS_KEY].size}) documented\n"
 end
 
 def db_query method , query , on_success_msg = ''
@@ -196,91 +233,50 @@ def add_ctag ctag_hash
   db_query :execute , "INSERT INTO Tags(#{keys}) VALUES(#{values})"
 end
 
-def correlate_ctags filename
-  # compare source entities to documented entities
-  source_ctags = @sources[CTAGS_KEY][filename]
-  doc_ctags    = @docs   [CTAGS_KEY][filename]
-  source_ids   = source_ctags.map { | ctag | ctag[IDENTIFIER_KEY] }
-  doc_ids      = doc_ctags   .map { | ctag | ctag[IDENTIFIER_KEY] }
-  undocumented_ids   = source_ids       - doc_ids
-  orphaned_ids       = doc_ids          - source_ids
-  correlated_ids     = source_ids       & doc_ids
-  undocumented_ctags = undocumented_ids.map { | id | source_ctags[source_ids.index id] }
-#   undocumented_ctags = source_ctags.select { | ctag | undocumented_ids.include? ctag[IDENTIFIER_KEY]}
+def hide_ctag filename , identifier , unused = nil , unused2 = nil
+  return if identifier.end_with? HIDDEN_CTAG_SENTINEL
 
-  print "#{correlated_ctags.size}/#{source_ctags.size}#{CORRELATED_TAGS_MSG}"
-  print "#{MISSING_TAG_MSG}#{orphaned_ctags.join "\n\t"}\n" unless orphaned_ctags.empty?
-  while identifier = orphaned_ctags.pop
-    print prompt = "#{ORPHAN_CTAG_PROMPT}'#{filename}' ?\n#{ORPHAN_CTAG_HANDLERS.to_s}\n?: "
-    print prompt until ORPHAN_CTAG_HANDLERS.include? (choice = STDIN.gets.strip[0])
-    send ORPHAN_CTAG_HANDLERS[choice] , filename , identifier , '' , undocumented_ids
+  rename_ctag filename , identifier , identifier + HIDDEN_CTAG_SENTINEL
+end
+
+def delete_ctag filename , identifier , unused = nil , unused2 = nil
+  db_query :execute , "DELETE FROM Tags "                           +
+                      "WHERE #{FILENAME_KEY  } IS '#{filename  }' " +
+                      "AND   #{IDENTIFIER_KEY} IS '#{identifier}'"  ,
+           "deleted entity '#{identifier}'\n"
+end
+
+def rename_ctag filename , old_identifier , new_identifier , undocumented_ids = []
+  if new_identifier.empty?
+    if undocumented_ids.empty?
+      print "no undocumented headers found - hiding instead\n"
+      hide_ctag filename , old_identifier
+      return
+    else
+      i = 0 ; ids = (undocumented_ids.map { | id | "\t#{i = i + 1}) #{id}" }).join "\n" ;
+      print prompt = "choose new identifier:\n#{ids}\n?: "
+      print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= undocumented_ids.size
+      new_identifier = undocumented_ids[choice - 1]
+    end
   end
 
-  add_ctag ctag_hash while ctag_hash = undocumented_ctags.pop
-end
-
-def hide_ctag filename , identifier
-  return if identifier.includes? HIDDEN_SENTINEL
-
-  rename_ctag filename , identifier , identifier + HIDDEN_SENTINEL
-end
-
-def delete_ctag filename , identifier
-  db_query :execute , "DELETE FROM Tags "                               +
-                      "WHERE #{FILENAME_KEY  } IS '#{filename      }' " +
-                      "AND   #{IDENTIFIER_KEY} IS '#{old_identifier}'"  ,
-           "deleted entity '#{identifier}'\n" ;
-end
-
-def rename_ctag filename , old_identifier , new_identifier , undocumented_ids
-  unless undocumented_ids.empty?
-    i = 0 ; ids = (undocumented_ids.map { | id | "\t#{i = i + 1}) #{id}" }).join "\n" ;
-    print prompt = "choose new identifier:\n#{ids}\n?: "
-    print prompt until (choice = STDIN.gets.to_i) > 0 && choice <= undocumented_ids.size
-    new_identifier = "#{DOC_DIR}/#{undocumented_ids[choice - 1]}"
-  end
-
-  db_query :execute , "UPDATE Tags SET #{identifier}='#{new_identifier}'" +
-                      "WHERE #{FILENAME_KEY  } IS '#{filename      }' "   +
-                      "AND   #{IDENTIFIER_KEY} IS '#{old_identifier}'"    ,
+  db_query :execute , "UPDATE Tags SET #{IDENTIFIER_KEY}='#{new_identifier}'" +
+                      "WHERE #{FILENAME_KEY  } IS '#{filename      }' "       +
+                      "AND   #{IDENTIFIER_KEY} IS '#{old_identifier}'"        ,
            "renamed entity '#{old_identifier}' to '#{new_identifier}'\n"
 end
 
-def write_doc_files filename
-  begin
-    doc_file = File.open "#{DOC_DIR}/#{filename}" , 'w'
 
-    @sources[CTAGS_KEY][filename].each do | ctag_hash |
-      identifier = ctag_hash[IDENTIFIER_KEY]
-      line_n     = ctag_hash[LINE_N_KEY    ]
-      prototype  = ctag_hash[PROTOTYPE_KEY ]
-      ctag       = db_read_ctag filename , identifier
-      is_dirty   = ctag[PROTOTYPE_KEY] != prototype || ctag[DOC_COMMENT_KEY].empty?
-      params     = "#{LINE_N_KEY  }='#{line_n            }', " +
-                   "#{IS_DIRTY_KEY}='#{(is_dirty) ? 1 : 0}'"
-
-dDEBUG_TRACE_LOAD_CTAG ctag
-
-      db_query :execute , "UPDATE Tags SET #{params}"               +
-                          "WHERE #{FILENAME_KEY} IS '#{filename}' " +
-                          "AND #{IDENTIFIER_KEY} IS '#{identifier}' "
-
-      doc_file << "#{ctag[DOC_COMMENT_KEY]}\n#{ctag[PROTOTYPE_KEY]}\n\n"
-    end
-  rescue ; raise "I/O error writing to file '#{DOC_DIR}/#{filename}'" ;
-  ensure ; doc_file.close
-  end
-end
-
-
-# main entry
+## main entry ##
 
 db_query :get_first_value , "SELECT SQLITE_VERSION()" # sanity check
 
-load_headers
-correlate_headers
-@sources[HEADERS_KEY].each do | filename |
-  load_ctags      filename
-  correlate_ctags filename
-  write_doc_files filename
+source_headers , doc_headers = load_headers
+
+correlate_headers source_headers , doc_headers
+source_headers.each do | filename |
+  source_ctags , doc_ctags = load_ctags filename
+
+  correlate_ctags filename , source_ctags , doc_ctags
+  write_doc_files filename , source_ctags
 end
